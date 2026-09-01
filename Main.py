@@ -1,34 +1,31 @@
 import os
-import re
 from datetime import datetime, timedelta
+
 import dateparser
 import spacy
 import telebot
-from spacy.matcher import Matcher
-
-from telebot import types
 from dotenv import load_dotenv
-
-
-
+from spacy.matcher import Matcher
 
 load_dotenv("ApiKeyFile.env")
 bot = telebot.TeleBot(os.getenv("API_KEY"))
 
-@bot.message_handler(commands=['start'])
+
+@bot.message_handler(commands=["start"])
 def start_message(message):
-    bot.send_message(message.chat.id, "Это бот, который создан для того, чтобы напоминать о чём-то "
-                                      "(пока это будет просто бот, возможно в будущем появится сайт "
-                                      "(может он уже появился))")
+    bot.send_message(
+        message.chat.id,
+        "Это бот, который создан для того, чтобы напоминать о чём-то "
+        "(пока это будет просто бот, возможно в будущем появится сайт "
+        "(может он уже появился))",
+    )
 
 
-@bot.message_handler(content_types=['text'])
+@bot.message_handler(content_types=["text"])
 def get_text(message):
-    chat_id = message.chat.id       # ID чата, откуда пришло сообщение
-    user_text = message.text        # Текст самого сообщения
-    user_name = message.from_user.first_name # Имя отправителя
-
-
+    chat_id = message.chat.id  # ID чата, откуда пришло сообщение
+    user_text = message.text  # Текст самого сообщения
+    user_name = message.from_user.first_name  # Имя отправителя
 
 
 '''def extract_with_spacy(text):
@@ -94,16 +91,16 @@ def parse_with_spacy_fixed(text):
     time_entities = []
 
     for ent in doc.ents:
-        if ent.label_ == 'DATE':
+        if ent.label_ == "DATE":
             date_parts.append(ent.text)
             date_entities.append(ent)
-        elif ent.label_ == 'TIME':
+        elif ent.label_ == "TIME":
             time_parts.append(ent.text)
             time_entities.append(ent)
 
     # 2. Обработка точных дат и времени
     if date_parts or time_parts:
-        full_str = ' '.join(date_parts + time_parts)
+        full_str = " ".join(date_parts + time_parts)
 
         # Проверяем наличие предлога "в" между датой и временем
         if date_parts and time_parts:
@@ -118,22 +115,19 @@ def parse_with_spacy_fixed(text):
             else:
                 full_str = f"{date_parts[-1]} {time_parts[0]}"
 
-        parsed = dateparser.parse(full_str, languages=['ru'])
+        parsed = dateparser.parse(full_str, languages=["ru"])
         if parsed:
             return {
-                'when': parsed,
-                'type': 'exact',
-                'date_str': ' '.join(date_parts),
-                'time_str': ' '.join(time_parts),
-                'text': text
+                "when": parsed,
+                "type": "exact",
+                "date_str": " ".join(date_parts),
+                "time_str": " ".join(time_parts),
+                "text": text,
             }
 
     # 3. Поиск дат через паттерны spaCy
     # 3.1. Дата с точками (25.12.2025) - используем токены
-    date_pattern = [
-        [{"SHAPE": "dd.dd.dddd"}],
-        [{"SHAPE": "dd.dd.dd"}]
-    ]
+    date_pattern = [[{"SHAPE": "dd.dd.dddd"}], [{"SHAPE": "dd.dd.dd"}]]
     matcher.add("DATE_DOTTED", date_pattern)
 
     matches = matcher(doc)
@@ -157,23 +151,23 @@ def parse_with_spacy_fixed(text):
 
         if time_match:
             full_str = f"{date_str} {time_match}"
-            parsed = dateparser.parse(full_str, languages=['ru'])
+            parsed = dateparser.parse(full_str, languages=["ru"])
             if parsed:
                 return {
-                    'when': parsed,
-                    'type': 'exact',
-                    'date_str': date_str,
-                    'time_str': time_match,
-                    'text': text
+                    "when": parsed,
+                    "type": "exact",
+                    "date_str": date_str,
+                    "time_str": time_match,
+                    "text": text,
                 }
         else:
-            parsed = dateparser.parse(date_str, languages=['ru'])
+            parsed = dateparser.parse(date_str, languages=["ru"])
             if parsed:
                 return {
-                    'when': parsed,
-                    'type': 'date_only',
-                    'date_str': date_str,
-                    'text': text
+                    "when": parsed,
+                    "type": "date_only",
+                    "date_str": date_str,
+                    "text": text,
                 }
 
     # 4. Поиск относительных дат (завтра, послезавтра)
@@ -182,9 +176,9 @@ def parse_with_spacy_fixed(text):
     day_after_tomorrow = False
 
     for token in doc:
-        if token.lemma_ in ['завтра', 'завтрашний']:
+        if token.lemma_ in ["завтра", "завтрашний"]:
             tomorrow = True
-        elif token.lemma_ in ['послезавтра']:
+        elif token.lemma_ in ["послезавтра"]:
             day_after_tomorrow = True
 
     if tomorrow or day_after_tomorrow:
@@ -208,26 +202,28 @@ def parse_with_spacy_fixed(text):
         else:
             full_str = f"послезавтра {time_match if time_match else '10:00'}"
 
-        parsed = dateparser.parse(full_str, languages=['ru'])
+        parsed = dateparser.parse(full_str, languages=["ru"])
         if parsed:
-            return {
-                'when': parsed,
-                'type': 'soon',
-                'text': text
-            }
+            return {"when": parsed, "type": "soon", "text": text}
 
     # 5. Поиск относительных интервалов (через X минут/часов/дней)
     # Используем синтаксический анализ для поиска конструкций "через X"
     for token in doc:
-        if token.lemma_ == 'через' and token.dep_ == 'case':
+        if token.lemma_ == "через" and token.dep_ == "case":
             # Ищем числительное после предлога
             for child in token.children:
-                if child.pos_ == 'NUM':
+                if child.pos_ == "NUM":
                     count = int(child.text)
                     # Ищем единицу измерения
                     unit_token = None
                     for child2 in child.children:
-                        if child2.pos_ == 'NOUN' and child2.lemma_ in ['минута', 'час', 'день', 'месяц', 'год']:
+                        if child2.pos_ == "NOUN" and child2.lemma_ in [
+                            "минута",
+                            "час",
+                            "день",
+                            "месяц",
+                            "год",
+                        ]:
                             unit_token = child2
                             break
 
@@ -235,41 +231,41 @@ def parse_with_spacy_fixed(text):
                         unit = unit_token.lemma_
                         delta = None
 
-                        if unit in ['минута']:
+                        if unit in ["минута"]:
                             delta = timedelta(minutes=count)
-                        elif unit in ['час']:
+                        elif unit in ["час"]:
                             delta = timedelta(hours=count)
-                        elif unit in ['день']:
+                        elif unit in ["день"]:
                             delta = timedelta(days=count)
-                        elif unit in ['месяц']:
+                        elif unit in ["месяц"]:
                             delta = timedelta(days=count * 30)
-                        elif unit in ['год']:
+                        elif unit in ["год"]:
                             delta = timedelta(days=count * 365)
 
                         if delta:
                             return {
-                                'when': datetime.now() + delta,
-                                'type': 'relative',
-                                'text': text
+                                "when": datetime.now() + delta,
+                                "type": "relative",
+                                "text": text,
                             }
 
     # 6. Поиск повторяющихся событий
     recurring = False
     for token in doc:
-        if token.lemma_ in ['каждый', 'еженедельный', 'ежедневный']:
+        if token.lemma_ in ["каждый", "еженедельный", "ежедневный"]:
             recurring = True
             break
 
     if recurring:
         # Ищем день недели через сущности или леммы
         weekdays = {
-            'понедельник': 'monday',
-            'вторник': 'tuesday',
-            'среда': 'wednesday',
-            'четверг': 'thursday',
-            'пятница': 'friday',
-            'суббота': 'saturday',
-            'воскресенье': 'sunday'
+            "понедельник": "monday",
+            "вторник": "tuesday",
+            "среда": "wednesday",
+            "четверг": "thursday",
+            "пятница": "friday",
+            "суббота": "saturday",
+            "воскресенье": "sunday",
         }
 
         found_day = None
@@ -295,7 +291,7 @@ def parse_with_spacy_fixed(text):
 
         if time_match:
             # Пробуем разные разделители
-            for sep in [':', '.', ';', '-']:
+            for sep in [":", ".", ";", "-"]:
                 if sep in time_match:
                     parts = time_match.split(sep)
                     if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
@@ -304,23 +300,23 @@ def parse_with_spacy_fixed(text):
 
         if found_day:
             return {
-                'when': None,
-                'type': 'recurring',
-                'recurring_type': 'weekly',
-                'weekday': weekdays.get(found_day, found_day),
-                'hour': hour,
-                'minute': minute,
-                'text': text
+                "when": None,
+                "type": "recurring",
+                "recurring_type": "weekly",
+                "weekday": weekdays.get(found_day, found_day),
+                "hour": hour,
+                "minute": minute,
+                "text": text,
             }
         else:
             # Ежедневное повторение
             return {
-                'when': None,
-                'type': 'recurring',
-                'recurring_type': 'daily',
-                'hour': hour,
-                'minute': minute,
-                'text': text
+                "when": None,
+                "type": "recurring",
+                "recurring_type": "daily",
+                "hour": hour,
+                "minute": minute,
+                "text": text,
             }
 
     # 7. Только время (сегодня)
@@ -337,20 +333,18 @@ def parse_with_spacy_fixed(text):
                 break
 
     if time_match:
-        for sep in [':', '.', ';', '-']:
+        for sep in [":", ".", ";", "-"]:
             if sep in time_match:
                 parts = time_match.split(sep)
                 if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
                     hour, minute = int(parts[0]), int(parts[1])
                     now = datetime.now()
-                    when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    when = now.replace(
+                        hour=hour, minute=minute, second=0, microsecond=0
+                    )
                     if when < now:
                         when += timedelta(days=1)
-                    return {
-                        'when': when,
-                        'type': 'time_only',
-                        'text': text
-                    }
+                    return {"when": when, "type": "time_only", "text": text}
 
     # 8. ДЕФОЛТ
     now = datetime.now()
@@ -359,36 +353,36 @@ def parse_with_spacy_fixed(text):
         when += timedelta(days=1)
 
     return {
-        'when': when,
-        'type': 'default',
-        'text': text,
-        'message': 'Установлено на завтра 10:00 (по умолчанию)'
+        "when": when,
+        "type": "default",
+        "text": text,
+        "message": "Установлено на завтра 10:00 (по умолчанию)",
     }
 
 
 def format_result(result):
     """Форматирует результат для вывода"""
-    if result['type'] == 'recurring':
-        if result['recurring_type'] == 'daily':
+    if result["type"] == "recurring":
+        if result["recurring_type"] == "daily":
             return f"🔄 Ежедневно в {result['hour']:02d}:{result['minute']:02d}"
         else:
             weekday_ru = {
-                'monday': 'понедельник',
-                'tuesday': 'вторник',
-                'wednesday': 'среда',
-                'thursday': 'четверг',
-                'friday': 'пятница',
-                'saturday': 'суббота',
-                'sunday': 'воскресенье'
+                "monday": "понедельник",
+                "tuesday": "вторник",
+                "wednesday": "среда",
+                "thursday": "четверг",
+                "friday": "пятница",
+                "saturday": "суббота",
+                "sunday": "воскресенье",
             }
-            day = result.get('weekday', '')
+            day = result.get("weekday", "")
             if day in weekday_ru:
                 day = weekday_ru[day]
             return f"🔄 Каждый {day} в {result['hour']:02d}:{result['minute']:02d}"
-    elif result.get('when'):
+    elif result.get("when"):
         return f"⏰ {result['when'].strftime('%d.%m.%Y %H:%M')}"
     else:
-        return result.get('message', 'Не удалось распарсить')
+        return result.get("message", "Не удалось распарсить")
 
 
 # === ТЕСТ ===
@@ -403,7 +397,7 @@ if __name__ == "__main__":
         "Встреча в 15:30",
         "Каждый день в 08:00",
         "Напомни через 2 часа",
-        "Послезавтра в 12:00"
+        "Послезавтра в 12:00",
     ]
 
     print("=" * 60)
@@ -415,7 +409,7 @@ if __name__ == "__main__":
         result = parse_with_spacy_fixed(text)
         print(f"   Тип: {result['type']}")
         print(f"   Результат: {format_result(result)}")
-        if result.get('message'):
+        if result.get("message"):
             print(f"   Сообщение: {result['message']}")
 
 

@@ -8,10 +8,14 @@ class NeuroNetwork:
         self.selected_layer = None
         self.activate_func = NeuroNetwork.sigmoid
         self.l_count = hidden_layers_count + 2
-        hidden_l_size = min(input_l_size * 2 - 1, ceil(input_l_size * 2 / 3 + output_l_size))
+        hidden_l_size = min(
+            input_l_size * 2 - 1, ceil(input_l_size * 2 / 3 + output_l_size)
+        )
 
         for i in range(self.l_count):
-            self.layers[i] = self.add_layer(i, input_l_size, output_l_size, hidden_l_size)
+            self.layers[i] = self.add_layer(
+                i, input_l_size, output_l_size, hidden_l_size
+            )
 
         self.selected_layer = None  # "чистим" указатель
 
@@ -41,22 +45,24 @@ class NeuroNetwork:
         return self.selected_layer
 
     def train(self, dataset, iters=1000):
-        print(f'\nTRAINING STARTED({iters} iterations)...')
+        print(f"\nTRAINING STARTED({iters} iterations)...")
         for _ in range(iters):
             self.train_once(dataset)
-        print(f'\nTRAINING COMPLETED!\n')
+        print("\nTRAINING COMPLETED!\n")
 
     def set_input_data(self, val_list):
         self.layers[0].set_input_data(val_list)
 
     def train_once(self, dataset):
         for case in dataset:
-            datacase = {'in_data': case[0], 'res': case[1]}
+            datacase = {"in_data": case[0], "res": case[1]}
 
-            self.set_input_data(datacase['in_data'])
+            self.set_input_data(datacase["in_data"])
             curr_res = self.get_prediction()
             for i in range(len(curr_res)):
-                self.layers[self.l_count - 1].neurons[i].set_error(curr_res[i] - datacase['res'])
+                self.layers[self.l_count - 1].neurons[i].set_error(
+                    curr_res[i] - datacase["res"]
+                )
 
 
 class Layer:
@@ -74,17 +80,31 @@ class Neuron:
     def __init__(self, layer: Layer, previous_layer: Layer):
         self.value = 0
         self._layer = layer
-        self.inputs = [Input(prev_neuron, randint(0, 10) / 10) for prev_neuron in
-                       previous_layer.neurons] if previous_layer else []
+        self.inputs = (
+            [
+                Input(prev_neuron, randint(0, 10) / 10)
+                for prev_neuron in previous_layer.neurons
+            ]
+            if previous_layer
+            else []
+        )
 
         self.get_value()
 
-
-    def set_error(self):
-        
-
     def is_no_inputs(self):
         return not self.inputs
+
+    def set_error(self, val):
+        if self.is_no_inputs():
+            return
+        w_delta = val * self._layer.network.derivate_func(self.get_input_sum())
+        for curr_input in self.inputs:
+            curr_input.weight -= (
+                curr_input.prev_neuron.get_value()
+                * w_delta
+                * self._layer.network.learning_rate
+            )
+            curr_input.prev_neuron.set_error(curr_input.weight * w_delta)
 
     def set_value(self, value):
         self.value = value
