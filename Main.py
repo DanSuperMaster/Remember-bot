@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F, types
@@ -13,6 +14,9 @@ from aiogram.types import BotCommand, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from dotenv import load_dotenv
+
+# Задаем целевую временную зону
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 load_dotenv("ApiKeyFile.env")
 bot = Bot(token=os.getenv("API_KEY"))
@@ -43,11 +47,11 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS reminders (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
-                target_datetime TIMESTAMP NOT NULL,
+                target_datetime TIMESTAMPTZ NOT NULL,
                 repeat_interval INTERVAL DEFAULT NULL,
                 message TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
@@ -76,60 +80,66 @@ repetionTimes = [
 async def check_reminders(bot: Bot, pool: asyncpg.Pool):
     while True:
         try:
+            now_moscow = datetime.now(MOSCOW_TZ)
             async with pool.acquire() as conn:
-                reminders = await conn.fetch("""
+                reminders = await conn.fetch(
+                    """
                     SELECT id, user_id, message, repeat_interval
                     FROM reminders
-                    WHERE is_active = TRUE AND target_datetime <= NOW();
-                """)
+                    WHERE is_active = TRUE AND target_datetime <= $1;
+                """,
+                    now_moscow,
+                )
 
-                # Если ничего нет — идем на следующий круг
                 if not reminders:
                     await asyncio.sleep(10)
                     continue
                 else:
-                    print("Need to remaind: " + len(reminders))
+                    print(f"Need to remind: {len(reminders)}")
 
-                for r in reminders:
-                    reminder_id = r["id"]
-                    user_id = r["user_id"]
-                    message_text = r["message"]
-                    repeat_interval = r["repeat_interval"]
-
-                    # 2. Пытаемся отправить сообщение
-                    sent_successfully = False
-                    try:
-                        await bot.send_message(
-                            chat_id=user_id,
-                            text=f"🔔 **Напоминание:**\n\n{message_text}",
-                            parse_mode="Markdown",
-                        )
-                        sent_successfully = True
-                    except Exception as send_error:
+                    for r in reminders:
                         print(
-                            f"❌ Ошибка отправки пользователю {user_id}: {send_error}"
+                            f"ID: {r['id']}, User: {r['user_id']}, Text: {r['message']}"
                         )
+                        reminder_id = r["id"]
+                        user_id = r["user_id"]
+                        message_text = r["message"]
+                        repeat_interval = r["repeat_interval"]
 
-                    # 3. Обновляем БД только если сообщение успешно ушло (или если нужно деактивировать битые)
-                    if sent_successfully:
-                        if repeat_interval:
-                            await conn.execute(
-                                """
-                                UPDATE reminders
-                                SET target_datetime = target_datetime + repeat_interval
-                                WHERE id = $1;
-                            """,
-                                reminder_id,
+                        # 2. Пытаемся отправить сообщение
+                        sent_successfully = False
+                        try:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=f"🔔 **Напоминание:**\n\n{message_text}",
+                                parse_mode="Markdown",
                             )
-                        else:
-                            await conn.execute(
-                                """
-                                UPDATE reminders
-                                SET is_active = FALSE
-                                WHERE id = $1;
-                            """,
-                                reminder_id,
+                            sent_successfully = True
+                        except Exception as send_error:
+                            print(
+                                f"❌ Ошибка отправки пользователю {user_id}: {send_error}"
                             )
+
+                        if sent_successfully:
+                            if repeat_interval:
+                                await conn.execute(
+                                    """
+                                    UPDATE reminders
+                                    SET target_datetime = target_datetime + $1
+                                    WHERE id = $2;
+                                """,
+                                    repeat_interval,
+                                    reminder_id,
+                                )
+                            else:
+                                await conn.execute(
+                                    """
+                                    UPDATE reminders
+                                    SET is_active = FALSE
+                                    WHERE id = $1;
+                                """,
+                                    reminder_id,
+                                )
 
         except Exception as e:
             print(f"❌ Критическая ошибка в фоновом цикле: {e}")
@@ -167,14 +177,14 @@ async def process_selection_time(callback: types.CallbackQuery, state: FSMContex
     if selected_option == "Кастомное":
         await callback.answer()
         calendar = SimpleCalendar()
-        now = datetime.now()
+        now = datetime.now(MOSCOW_TZ)
         calendar_markup = await calendar.start_calendar(year=now.year, month=now.month)
         await callback.message.edit_text(
             "Выберите дату на календаре:", reply_markup=calendar_markup
         )
         return
 
-    now_date = datetime.now().date()
+    now_date = datetime.now(MOSCOW_TZ).date()
     if selected_option == "Сегодня":
         target_date = now_date
     elif selected_option == "Завтра":
@@ -182,7 +192,6 @@ async def process_selection_time(callback: types.CallbackQuery, state: FSMContex
     elif selected_option == "Через неделю":
         target_date = now_date + timedelta(weeks=1)
 
-    # Исправлено: сохраняем 'day' для текста подтверждения и 'day_iso' для БД
     await state.update_data(
         day=selected_option, day_iso=target_date.strftime("%Y-%m-%d")
     )
@@ -304,17 +313,16 @@ async def process_selection_text(callback: types.CallbackQuery, state: FSMContex
         )
         return
 
-    # Используем timedelta вместо строк
     interval_map = {
+        "Нет повторения": None,
         "Каждый день": timedelta(days=1),
         "Каждую неделю": timedelta(weeks=1),
-        "Каждый месяц": timedelta(
-            days=30
-        ),  # В timedelta нет месяцев, используем 30 дней
+        "Каждый месяц": timedelta(days=30),
     }
 
     await state.update_data(
-        repetion=selected_option, repeat_interval=interval_map[selected_option]
+        repetion=selected_option,
+        repeat_interval=interval_map.get(selected_option),
     )
     await state.set_state(User.waiting_for_text)
 
@@ -337,7 +345,6 @@ async def process_custom_repeat_input(message: types.Message, state: FSMContext)
 
     days, hours, minutes = map(int, repeat_text.split(":"))
 
-    # Создаем timedelta объект
     pg_interval = timedelta(days=days, hours=hours, minutes=minutes)
     selected_repeat = f"Каждые {days}д. {hours}ч. {minutes}мин."
 
@@ -380,31 +387,35 @@ async def process_text_input(message: types.Message, state: FSMContext):
 async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
     user_data = await state.get_data()
 
-    # Исправлено: раскомментировано получение day_iso и добавлена защита
     day_iso = user_data.get("day_iso")
     time_val = user_data.get("time_val")
+
+    now_moscow = datetime.now(MOSCOW_TZ)
 
     if not day_iso:
         day_str = user_data.get("day", "")
         if "сегодня" in day_str.lower():
-            day_iso = datetime.now().strftime("%Y-%m-%d")
+            day_iso = now_moscow.strftime("%Y-%m-%d")
         elif "завтра" in day_str.lower():
-            day_iso = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            day_iso = (now_moscow + timedelta(days=1)).strftime("%Y-%m-%d")
         elif "неделю" in day_str.lower():
-            day_iso = (datetime.now() + timedelta(weeks=1)).strftime("%Y-%m-%d")
+            day_iso = (now_moscow + timedelta(weeks=1)).strftime("%Y-%m-%d")
         else:
             try:
                 parsed_date = datetime.strptime(day_str, "%d.%m.%Y")
                 day_iso = parsed_date.strftime("%Y-%m-%d")
             except ValueError:
-                day_iso = datetime.now().strftime("%Y-%m-%d")
+                day_iso = now_moscow.strftime("%Y-%m-%d")
 
     if not time_val:
         time_str = user_data.get("time", "10:00").replace("в ", "").strip()
         time_val = time_str
 
     dt_string = f"{day_iso} {time_val}"
-    target_datetime = datetime.strptime(dt_string, "%Y-%m-%d %H:%M")
+
+    # Перевод строкового времени в timezone-aware datetime с таймзоной МСК
+    naive_dt = datetime.strptime(dt_string, "%Y-%m-%d %H:%M")
+    target_datetime = naive_dt.replace(tzinfo=MOSCOW_TZ)
 
     user_id = user_data["user_id"]
     repeat_interval = user_data.get("repeat_interval")
@@ -460,14 +471,11 @@ async def main():
         await init_db()
         print("БД успешно подключена!")
 
-        # Установка команд меню
         await set_main_menu(bot)
         print("Бот запущен!")
 
-        # Запускаем фоновую задачу
         asyncio.create_task(check_reminders(bot, db_pool))
 
-        # Запуск поллинга
         await dp.start_polling(bot)
     finally:
         if db_pool:
