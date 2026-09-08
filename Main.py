@@ -77,74 +77,209 @@ repetionTimes = [
 ]
 
 
+def build_reminder_keyboard(
+    reminder_id: int, is_repeatable: bool
+) -> types.InlineKeyboardMarkup:
+    """Вспомогательная функция для сборки кнопок управления напоминанием."""
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(
+            text="+15 мин", callback_data=f"rem_delay_15_{reminder_id}"
+        )
+    )
+    builder.add(
+        InlineKeyboardButton(
+            text="+30 мин", callback_data=f"rem_delay_30_{reminder_id}"
+        )
+    )
+    builder.add(
+        InlineKeyboardButton(text="+1 час", callback_data=f"rem_delay_60_{reminder_id}")
+    )
+
+    if is_repeatable:
+        builder.add(
+            InlineKeyboardButton(
+                text="❌ Завершить (отключить)", callback_data=f"rem_stop_{reminder_id}"
+            )
+        )
+    else:
+        builder.add(
+            InlineKeyboardButton(
+                text="✅ Выполнено", callback_data=f"rem_done_{reminder_id}"
+            )
+        )
+
+    builder.adjust(3, 1)
+    return builder.as_markup()
+
+
 async def check_reminders(bot: Bot, pool: asyncpg.Pool):
+    last_cleanup_time = datetime.min.replace(tzinfo=MOSCOW_TZ)
+    CLEANUP_INTERVAL = timedelta(hours=24)
+
     while True:
         try:
             now_moscow = datetime.now(MOSCOW_TZ)
+
             async with pool.acquire() as conn:
+                if now_moscow - last_cleanup_time >= CLEANUP_INTERVAL:
+                    deleted_count = await conn.execute(
+                        """
+                        DELETE FROM reminders
+                        WHERE is_active = FALSE OR (repeat_interval IS NULL AND target_datetime < $1);
+                        """,
+                        now_moscow - timedelta(hours=3),
+                    )
+                    print(
+                        f"Очистка БД: удалены устаревшие/неактивные записи ({deleted_count})"
+                    )
+                    last_cleanup_time = now_moscow
+
                 reminders = await conn.fetch(
                     """
                     SELECT id, user_id, message, repeat_interval
                     FROM reminders
                     WHERE is_active = TRUE AND target_datetime <= $1;
-                """,
+                    """,
                     now_moscow,
                 )
 
                 if not reminders:
                     await asyncio.sleep(10)
                     continue
-                else:
-                    print(f"Need to remind: {len(reminders)}")
 
-                    for r in reminders:
-                        print(
-                            f"ID: {r['id']}, User: {r['user_id']}, Text: {r['message']}"
+                for r in reminders:
+                    reminder_id = r["id"]
+                    user_id = r["user_id"]
+                    message_text = r["message"]
+                    repeat_interval = r["repeat_interval"]
+
+                    keyboard = build_reminder_keyboard(
+                        reminder_id, is_repeatable=bool(repeat_interval)
+                    )
+
+                    sent_successfully = False
+                    try:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=f"🔔 **Напоминание:**\n\n{message_text}",
+                            reply_markup=keyboard,
+                            parse_mode="Markdown",
                         )
-                        reminder_id = r["id"]
-                        user_id = r["user_id"]
-                        message_text = r["message"]
-                        repeat_interval = r["repeat_interval"]
+                        sent_successfully = True
+                    except Exception as send_error:
+                        print(
+                            f"❌ Ошибка отправки пользователю {user_id}: {send_error}"
+                        )
 
-                        # 2. Пытаемся отправить сообщение
-                        sent_successfully = False
-                        try:
-                            await bot.send_message(
-                                chat_id=user_id,
-                                text=f"🔔 **Напоминание:**\n\n{message_text}",
-                                parse_mode="Markdown",
+                    if sent_successfully:
+                        if repeat_interval:
+                            await conn.execute(
+                                """
+                                UPDATE reminders
+                                SET target_datetime = target_datetime + $1
+                                WHERE id = $2;
+                                """,
+                                repeat_interval,
+                                reminder_id,
                             )
-                            sent_successfully = True
-                        except Exception as send_error:
-                            print(
-                                f"❌ Ошибка отправки пользователю {user_id}: {send_error}"
-                            )
+                        else:
+                            temp_future_time = now_moscow + timedelta(hours=3)
 
-                        if sent_successfully:
-                            if repeat_interval:
-                                await conn.execute(
-                                    """
-                                    UPDATE reminders
-                                    SET target_datetime = target_datetime + $1
-                                    WHERE id = $2;
+                            await conn.execute(
+                                """
+                                UPDATE reminders
+                                SET target_datetime = $1
+                                WHERE id = $2;
                                 """,
-                                    repeat_interval,
-                                    reminder_id,
-                                )
-                            else:
-                                await conn.execute(
-                                    """
-                                    UPDATE reminders
-                                    SET is_active = FALSE
-                                    WHERE id = $1;
-                                """,
-                                    reminder_id,
-                                )
+                                temp_future_time,
+                                reminder_id,
+                            )
 
         except Exception as e:
             print(f"❌ Критическая ошибка в фоновом цикле: {e}")
 
         await asyncio.sleep(10)
+
+
+@dp.callback_query(F.data.startswith("rem_delay_"))
+async def process_reminder_delay(callback: types.CallbackQuery):
+    # Callback format: rem_delay_{minutes}_{reminder_id}
+    parts = callback.data.split("_")
+    minutes = int(parts[2])
+    reminder_id = int(parts[3])
+
+    new_time = datetime.now(MOSCOW_TZ) + timedelta(minutes=minutes)
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE reminders
+                SET target_datetime = $1, is_active = TRUE
+                WHERE id = $2;
+                """,
+                new_time,
+                reminder_id,
+            )
+
+        await callback.answer(f"Отложено на {minutes} мин.")
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n⏳ *Отложено на {minutes} минут*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"Ошибка при переносе напоминания: {e}")
+        await callback.answer("Ошибка при изменении времени.")
+
+
+@dp.callback_query(F.data.startswith("rem_done_"))
+async def process_reminder_done(callback: types.CallbackQuery):
+    reminder_id = int(callback.data.split("_")[2])
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE reminders
+                SET is_active = FALSE
+                WHERE id = $1;
+                """,
+                reminder_id,
+            )
+
+        await callback.answer("Выполнено!")
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n✅ *Выполнено*", parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Ошибка при отметке выполнения: {e}")
+        await callback.answer("Ошибка!")
+
+
+@dp.callback_query(F.data.startswith("rem_stop_"))
+async def process_reminder_stop(callback: types.CallbackQuery):
+    reminder_id = int(callback.data.split("_")[2])
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE reminders
+                SET is_active = FALSE
+                WHERE id = $1;
+                """,
+                reminder_id,
+            )
+
+        await callback.answer("Повторение остановлено!")
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n🛑 *Повторение завершено*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"Ошибка при остановке повторений: {e}")
+        await callback.answer("Ошибка!")
 
 
 @dp.message(Command("start"))
@@ -413,7 +548,6 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
 
     dt_string = f"{day_iso} {time_val}"
 
-    # Перевод строкового времени в timezone-aware datetime с таймзоной МСК
     naive_dt = datetime.strptime(dt_string, "%Y-%m-%d %H:%M")
     target_datetime = naive_dt.replace(tzinfo=MOSCOW_TZ)
 
@@ -423,7 +557,7 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
 
     query = """
         INSERT INTO reminders (user_id, target_datetime, repeat_interval, message)
-        VALUES ($1, $2, $3::interval, $4);
+        VALUES ($1, $2, $3, $4);
     """
 
     try:
