@@ -1,416 +1,479 @@
+import asyncio
 import os
+import re
 from datetime import datetime, timedelta
 
-import dateparser
-import spacy
-import telebot
+import asyncpg
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from dotenv import load_dotenv
-from spacy.matcher import Matcher
 
 load_dotenv("ApiKeyFile.env")
-bot = telebot.TeleBot(os.getenv("API_KEY"))
+bot = Bot(token=os.getenv("API_KEY"))
+dp = Dispatcher(storage=MemoryStorage())
+
+DB_USER = os.getenv("POSTGRES_USER")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+DB_NAME = os.getenv("POSTGRES_DB")
+DB_HOST = "localhost"
+DB_PORT = 16500
+
+db_pool: asyncpg.Pool = None
 
 
-@bot.message_handler(commands=["start"])
-def start_message(message):
-    bot.send_message(
-        message.chat.id,
-        "Это бот, который создан для того, чтобы напоминать о чём-то "
-        "(пока это будет просто бот, возможно в будущем появится сайт "
-        "(может он уже появился))",
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+        ssl=False,
+    )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                target_datetime TIMESTAMP NOT NULL,
+                repeat_interval INTERVAL DEFAULT NULL,
+                message TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+
+class User(StatesGroup):
+    waiting_for_day = State()
+    waiting_for_time = State()
+    waiting_for_custom_time = State()
+    waiting_for_repeat = State()
+    waiting_for_custom_repeat = State()
+    waiting_for_text = State()
+    waiting_for_confirmation = State()
+
+
+dayTimes = ["Сегодня", "Завтра", "Через неделю", "Кастомное"]
+timeTimes = ["в 10:00", "в 14:00", "в 18:00", "Кастомное"]
+repetionTimes = [
+    "Нет повторения",
+    "Каждый день",
+    "Каждую неделю",
+    "Каждый месяц",
+    "Кастомное",
+]
+
+
+async def check_reminders(bot: Bot, pool: asyncpg.Pool):
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                reminders = await conn.fetch("""
+                    SELECT id, user_id, message, repeat_interval
+                    FROM reminders
+                    WHERE is_active = TRUE AND target_datetime <= NOW();
+                """)
+
+                # Если ничего нет — идем на следующий круг
+                if not reminders:
+                    await asyncio.sleep(10)
+                    continue
+                else:
+                    print("Need to remaind: " + len(reminders))
+
+                for r in reminders:
+                    reminder_id = r["id"]
+                    user_id = r["user_id"]
+                    message_text = r["message"]
+                    repeat_interval = r["repeat_interval"]
+
+                    # 2. Пытаемся отправить сообщение
+                    sent_successfully = False
+                    try:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=f"🔔 **Напоминание:**\n\n{message_text}",
+                            parse_mode="Markdown",
+                        )
+                        sent_successfully = True
+                    except Exception as send_error:
+                        print(
+                            f"❌ Ошибка отправки пользователю {user_id}: {send_error}"
+                        )
+
+                    # 3. Обновляем БД только если сообщение успешно ушло (или если нужно деактивировать битые)
+                    if sent_successfully:
+                        if repeat_interval:
+                            await conn.execute(
+                                """
+                                UPDATE reminders
+                                SET target_datetime = target_datetime + repeat_interval
+                                WHERE id = $1;
+                            """,
+                                reminder_id,
+                            )
+                        else:
+                            await conn.execute(
+                                """
+                                UPDATE reminders
+                                SET is_active = FALSE
+                                WHERE id = $1;
+                            """,
+                                reminder_id,
+                            )
+
+        except Exception as e:
+            print(f"❌ Критическая ошибка в фоновом цикле: {e}")
+
+        await asyncio.sleep(10)
+
+
+@dp.message(Command("start"))
+async def start_message(message: types.Message):
+    await message.answer("Это бот, который создан для того, чтобы напоминать о чём-то.")
+
+
+@dp.message(Command("start_notification"))
+async def getNotification(message: types.Message, state: FSMContext):
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+
+    await state.set_state(User.waiting_for_day)
+    await state.update_data(user_id=message.from_user.id)
+
+    for i in range(len(dayTimes)):
+        builder.add(InlineKeyboardButton(text=dayTimes[i], callback_data=f"select_{i}"))
+
+    builder.adjust(2)
+    await message.answer(
+        "Выберите дату из списка ниже:", reply_markup=builder.as_markup()
     )
 
 
-@bot.message_handler(content_types=["text"])
-def get_text(message):
-    chat_id = message.chat.id  # ID чата, откуда пришло сообщение
-    user_text = message.text  # Текст самого сообщения
-    user_name = message.from_user.first_name  # Имя отправителя
+@dp.callback_query(F.data.startswith("select_"), User.waiting_for_day)
+async def process_selection_time(callback: types.CallbackQuery, state: FSMContext):
+    date_id = int(callback.data.split("_")[1])
+    selected_option = dayTimes[date_id]
+
+    if selected_option == "Кастомное":
+        await callback.answer()
+        calendar = SimpleCalendar()
+        now = datetime.now()
+        calendar_markup = await calendar.start_calendar(year=now.year, month=now.month)
+        await callback.message.edit_text(
+            "Выберите дату на календаре:", reply_markup=calendar_markup
+        )
+        return
+
+    now_date = datetime.now().date()
+    if selected_option == "Сегодня":
+        target_date = now_date
+    elif selected_option == "Завтра":
+        target_date = now_date + timedelta(days=1)
+    elif selected_option == "Через неделю":
+        target_date = now_date + timedelta(weeks=1)
+
+    # Исправлено: сохраняем 'day' для текста подтверждения и 'day_iso' для БД
+    await state.update_data(
+        day=selected_option, day_iso=target_date.strftime("%Y-%m-%d")
+    )
+    await state.set_state(User.waiting_for_time)
+
+    builder = InlineKeyboardBuilder()
+    for i in range(len(timeTimes)):
+        builder.add(InlineKeyboardButton(text=timeTimes[i], callback_data=f"time_{i}"))
+    builder.adjust(2)
+
+    await callback.answer(f"Вы выбрали: {selected_option}")
+    await callback.message.edit_text(
+        f"Вы выбрали день: {selected_option}\nТеперь выберите время:",
+        reply_markup=builder.as_markup(),
+    )
 
 
-'''def extract_with_spacy(text):
-    """
-    Извлекает даты, время, числа из текста с помощью spaCy
-    """
-    doc = nlp(text)
+@dp.callback_query(SimpleCalendarCallback.filter(), User.waiting_for_day)
+async def process_custom_date(
+    callback: types.CallbackQuery,
+    callback_data: SimpleCalendarCallback,
+    state: FSMContext,
+):
+    calendar = SimpleCalendar()
+    selected, date = await calendar.process_selection(callback, callback_data)
 
-    result = {
-        'dates': [],
-        'times': [],
-        'numbers': [],
-        'tokens': [],
-        'entities': []
+    if selected:
+        formatted_date = date.strftime("%d.%m.%Y")
+        await state.update_data(day=formatted_date, day_iso=date.strftime("%Y-%m-%d"))
+        await state.set_state(User.waiting_for_time)
+
+        builder = InlineKeyboardBuilder()
+        for i in range(len(timeTimes)):
+            builder.add(
+                InlineKeyboardButton(text=timeTimes[i], callback_data=f"time_{i}")
+            )
+        builder.adjust(2)
+
+        await callback.message.edit_text(
+            f"Вы выбрали дату: {formatted_date}\nТеперь выберите время:",
+            reply_markup=builder.as_markup(),
+        )
+
+
+@dp.callback_query(F.data.startswith("time_"), User.waiting_for_time)
+async def process_selection_repetion(callback: types.CallbackQuery, state: FSMContext):
+    time_id = int(callback.data.split("_")[1])
+    selected_option = timeTimes[time_id]
+
+    if selected_option == "Кастомное":
+        await callback.answer()
+        await state.set_state(User.waiting_for_custom_time)
+        await callback.message.edit_text(
+            "Введите время в формате **ЧЧ:ММ** (например, 14:30 или 09:00):",
+            parse_mode="Markdown",
+        )
+        return
+
+    time_clean = selected_option.replace("в ", "").strip()
+    await state.update_data(time=selected_option, time_val=time_clean)
+    await state.set_state(User.waiting_for_repeat)
+
+    builder = InlineKeyboardBuilder()
+    for i in range(len(repetionTimes)):
+        builder.add(
+            InlineKeyboardButton(text=repetionTimes[i], callback_data=f"repetion_{i}")
+        )
+    builder.adjust(2)
+
+    await callback.answer(f"Вы выбрали: {selected_option}")
+    await callback.message.edit_text(
+        f"Вы выбрали время: {selected_option}\nТеперь выберите повторение:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.message(User.waiting_for_custom_time)
+async def process_custom_time_input(message: types.Message, state: FSMContext):
+    time_text = message.text.strip().replace(".", ":")
+
+    if not re.match(r"^([01]?[0-9]|2[0-3]):[0-5][0-9]$", time_text):
+        await message.answer(
+            "Некорректный формат времени! Пожалуйста, введите время в формате **ЧЧ:ММ** (например, 15:45):",
+            parse_mode="Markdown",
+        )
+        return
+
+    h, m = time_text.split(":")
+    formatted_time = f"{int(h):02d}:{int(m):02d}"
+
+    await state.update_data(time=f"в {formatted_time}", time_val=formatted_time)
+    await state.set_state(User.waiting_for_repeat)
+
+    builder = InlineKeyboardBuilder()
+    for i in range(len(repetionTimes)):
+        builder.add(
+            InlineKeyboardButton(text=repetionTimes[i], callback_data=f"repetion_{i}")
+        )
+    builder.adjust(2)
+
+    await message.answer(
+        f"Вы выбрали время: в {formatted_time}\nТеперь выберите повторение:",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("repetion_"), User.waiting_for_repeat)
+async def process_selection_text(callback: types.CallbackQuery, state: FSMContext):
+    repetion_id = int(callback.data.split("_")[1])
+    selected_option = repetionTimes[repetion_id]
+
+    if selected_option == "Кастомное":
+        await callback.answer()
+        await state.set_state(User.waiting_for_custom_repeat)
+        await callback.message.edit_text(
+            "Введите интервал повторения в формате **ДД:ЧЧ:ММ**\n"
+            "(где ДД — дни, ЧЧ — часы, ММ — минуты, например: `01:12:30`):",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Используем timedelta вместо строк
+    interval_map = {
+        "Каждый день": timedelta(days=1),
+        "Каждую неделю": timedelta(weeks=1),
+        "Каждый месяц": timedelta(
+            days=30
+        ),  # В timedelta нет месяцев, используем 30 дней
     }
 
-    # Собираем все сущности
-    for ent in doc.ents:
-        result['entities'].append({
-            'text': ent.text,
-            'label': ent.label_,
-            'start': ent.start_char,
-            'end': ent.end_char
-        })
+    await state.update_data(
+        repetion=selected_option, repeat_interval=interval_map[selected_option]
+    )
+    await state.set_state(User.waiting_for_text)
 
-        if ent.label_ == 'DATE':
-            result['dates'].append(ent.text)
-        elif ent.label_ == 'TIME':
-            result['times'].append(ent.text)
-
-    # Собираем токены (слова) с их частями речи
-    for token in doc:
-        result['tokens'].append({
-            'text': token.text,
-            'lemma': token.lemma_,  # начальная форма
-            'pos': token.pos_,  # часть речи
-            'dep': token.dep_  # синтаксическая роль
-        })
-
-        # Если это число
-        if token.pos_ == 'NUM':
-            result['numbers'].append(token.text)
-
-    return result'''
+    await callback.answer(f"Вы выбрали: {selected_option}")
+    await callback.message.edit_text(
+        f"Вы выбрали повторение: {selected_option}\nТеперь введите текст напоминания сообщением:"
+    )
 
 
-nlp = spacy.load("ru_core_news_sm")
+@dp.message(User.waiting_for_custom_repeat)
+async def process_custom_repeat_input(message: types.Message, state: FSMContext):
+    repeat_text = message.text.strip().replace(".", ":")
+
+    if not re.match(r"^\d{2}:([01]\d|2[0-3]):[0-5]\d$", repeat_text):
+        await message.answer(
+            "Некорректный формат! Введите интервал в формате **ДД:ЧЧ:ММ** (например, `00:08:00`):",
+            parse_mode="Markdown",
+        )
+        return
+
+    days, hours, minutes = map(int, repeat_text.split(":"))
+
+    # Создаем timedelta объект
+    pg_interval = timedelta(days=days, hours=hours, minutes=minutes)
+    selected_repeat = f"Каждые {days}д. {hours}ч. {minutes}мин."
+
+    await state.update_data(repetion=selected_repeat, repeat_interval=pg_interval)
+    await state.set_state(User.waiting_for_text)
+
+    await message.answer(
+        f"Вы выбрали повторение: {selected_repeat}\nТеперь введите текст напоминания сообщением:"
+    )
 
 
-def parse_with_spacy_fixed(text):
+@dp.message(User.waiting_for_text)
+async def process_text_input(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    await state.update_data(text=text)
+    await state.set_state(User.waiting_for_confirmation)
+
+    user_data = await state.get_data()
+
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="Подтвердить", callback_data="confirm_yes"))
+    builder.add(InlineKeyboardButton(text="Отмена", callback_data="confirm_no"))
+    builder.adjust(2)
+
+    summary = (
+        "**Проверьте данные вашего напоминания:**\n\n"
+        f"**Дата:** {user_data.get('day')}\n"
+        f"**Время:** {user_data.get('time')}\n"
+        f"**Повторение:** {user_data.get('repetion')}\n"
+        f"**Текст:** {user_data.get('text')}\n\n"
+        "Всё верно?"
+    )
+
+    await message.answer(
+        summary, reply_markup=builder.as_markup(), parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data == "confirm_yes", User.waiting_for_confirmation)
+async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+
+    # Исправлено: раскомментировано получение day_iso и добавлена защита
+    day_iso = user_data.get("day_iso")
+    time_val = user_data.get("time_val")
+
+    if not day_iso:
+        day_str = user_data.get("day", "")
+        if "сегодня" in day_str.lower():
+            day_iso = datetime.now().strftime("%Y-%m-%d")
+        elif "завтра" in day_str.lower():
+            day_iso = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif "неделю" in day_str.lower():
+            day_iso = (datetime.now() + timedelta(weeks=1)).strftime("%Y-%m-%d")
+        else:
+            try:
+                parsed_date = datetime.strptime(day_str, "%d.%m.%Y")
+                day_iso = parsed_date.strftime("%Y-%m-%d")
+            except ValueError:
+                day_iso = datetime.now().strftime("%Y-%m-%d")
+
+    if not time_val:
+        time_str = user_data.get("time", "10:00").replace("в ", "").strip()
+        time_val = time_str
+
+    dt_string = f"{day_iso} {time_val}"
+    target_datetime = datetime.strptime(dt_string, "%Y-%m-%d %H:%M")
+
+    user_id = user_data["user_id"]
+    repeat_interval = user_data.get("repeat_interval")
+    message_text = user_data["text"]
+
+    query = """
+        INSERT INTO reminders (user_id, target_datetime, repeat_interval, message)
+        VALUES ($1, $2, $3::interval, $4);
     """
-    Парсер на основе spaCy с минимальным использованием регулярок
-    """
-    doc = nlp(text)
 
-    # Создаем матчер для расширенного поиска
-    matcher = Matcher(nlp.vocab)
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                query,
+                user_id,
+                target_datetime,
+                repeat_interval,
+                message_text,
+            )
 
-    # 1. Собираем даты и время из сущностей
-    date_parts = []
-    time_parts = []
-    date_entities = []
-    time_entities = []
+        await callback.answer("Сохранено!")
+        await callback.message.edit_text(
+            "🎉 **Напоминание успешно создано и сохранено в Базу Данных!**",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"Ошибка при записи в БД: {e}")
+        await callback.answer("Ошибка при сохранении!")
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при сохранении в базу данных."
+        )
 
-    for ent in doc.ents:
-        if ent.label_ == "DATE":
-            date_parts.append(ent.text)
-            date_entities.append(ent)
-        elif ent.label_ == "TIME":
-            time_parts.append(ent.text)
-            time_entities.append(ent)
-
-    # 2. Обработка точных дат и времени
-    if date_parts or time_parts:
-        full_str = " ".join(date_parts + time_parts)
-
-        # Проверяем наличие предлога "в" между датой и временем
-        if date_parts and time_parts:
-            # Находим позиции в тексте
-            date_end = date_entities[-1].end_char if date_entities else 0
-            time_start = time_entities[0].start_char if time_entities else 0
-
-            # Проверяем, есть ли "в" между ними
-            between = text[date_end:time_start] if date_end < time_start else ""
-            if "в" in between:
-                full_str = f"{date_parts[-1]} в {time_parts[0]}"
-            else:
-                full_str = f"{date_parts[-1]} {time_parts[0]}"
-
-        parsed = dateparser.parse(full_str, languages=["ru"])
-        if parsed:
-            return {
-                "when": parsed,
-                "type": "exact",
-                "date_str": " ".join(date_parts),
-                "time_str": " ".join(time_parts),
-                "text": text,
-            }
-
-    # 3. Поиск дат через паттерны spaCy
-    # 3.1. Дата с точками (25.12.2025) - используем токены
-    date_pattern = [[{"SHAPE": "dd.dd.dddd"}], [{"SHAPE": "dd.dd.dd"}]]
-    matcher.add("DATE_DOTTED", date_pattern)
-
-    matches = matcher(doc)
-    for match_id, start, end in matches:
-        span = doc[start:end]
-        date_str = span.text
-
-        # Ищем время рядом (через сущности TIME или через токены)
-        time_match = None
-        for token in doc:
-            if token.ent_type_ == "TIME":
-                time_match = token.text
-                break
-
-        # Если не нашли TIME сущность, ищем по шаблону времени
-        if not time_match:
-            for ent in doc.ents:
-                if ent.label_ == "TIME":
-                    time_match = ent.text
-                    break
-
-        if time_match:
-            full_str = f"{date_str} {time_match}"
-            parsed = dateparser.parse(full_str, languages=["ru"])
-            if parsed:
-                return {
-                    "when": parsed,
-                    "type": "exact",
-                    "date_str": date_str,
-                    "time_str": time_match,
-                    "text": text,
-                }
-        else:
-            parsed = dateparser.parse(date_str, languages=["ru"])
-            if parsed:
-                return {
-                    "when": parsed,
-                    "type": "date_only",
-                    "date_str": date_str,
-                    "text": text,
-                }
-
-    # 4. Поиск относительных дат (завтра, послезавтра)
-    # Используем леммы для поиска
-    tomorrow = False
-    day_after_tomorrow = False
-
-    for token in doc:
-        if token.lemma_ in ["завтра", "завтрашний"]:
-            tomorrow = True
-        elif token.lemma_ in ["послезавтра"]:
-            day_after_tomorrow = True
-
-    if tomorrow or day_after_tomorrow:
-        # Ищем время через сущности TIME
-        time_match = None
-        for ent in doc.ents:
-            if ent.label_ == "TIME":
-                time_match = ent.text
-                break
-
-        if not time_match:
-            # Ищем время через токены
-            for token in doc:
-                # Проверяем, похоже ли на время (цифры и двоеточие)
-                if token.shape_ == "dd:dd" or token.shape_ == "dd.dd":
-                    time_match = token.text
-                    break
-
-        if tomorrow:
-            full_str = f"завтра {time_match if time_match else '10:00'}"
-        else:
-            full_str = f"послезавтра {time_match if time_match else '10:00'}"
-
-        parsed = dateparser.parse(full_str, languages=["ru"])
-        if parsed:
-            return {"when": parsed, "type": "soon", "text": text}
-
-    # 5. Поиск относительных интервалов (через X минут/часов/дней)
-    # Используем синтаксический анализ для поиска конструкций "через X"
-    for token in doc:
-        if token.lemma_ == "через" and token.dep_ == "case":
-            # Ищем числительное после предлога
-            for child in token.children:
-                if child.pos_ == "NUM":
-                    count = int(child.text)
-                    # Ищем единицу измерения
-                    unit_token = None
-                    for child2 in child.children:
-                        if child2.pos_ == "NOUN" and child2.lemma_ in [
-                            "минута",
-                            "час",
-                            "день",
-                            "месяц",
-                            "год",
-                        ]:
-                            unit_token = child2
-                            break
-
-                    if unit_token:
-                        unit = unit_token.lemma_
-                        delta = None
-
-                        if unit in ["минута"]:
-                            delta = timedelta(minutes=count)
-                        elif unit in ["час"]:
-                            delta = timedelta(hours=count)
-                        elif unit in ["день"]:
-                            delta = timedelta(days=count)
-                        elif unit in ["месяц"]:
-                            delta = timedelta(days=count * 30)
-                        elif unit in ["год"]:
-                            delta = timedelta(days=count * 365)
-
-                        if delta:
-                            return {
-                                "when": datetime.now() + delta,
-                                "type": "relative",
-                                "text": text,
-                            }
-
-    # 6. Поиск повторяющихся событий
-    recurring = False
-    for token in doc:
-        if token.lemma_ in ["каждый", "еженедельный", "ежедневный"]:
-            recurring = True
-            break
-
-    if recurring:
-        # Ищем день недели через сущности или леммы
-        weekdays = {
-            "понедельник": "monday",
-            "вторник": "tuesday",
-            "среда": "wednesday",
-            "четверг": "thursday",
-            "пятница": "friday",
-            "суббота": "saturday",
-            "воскресенье": "sunday",
-        }
-
-        found_day = None
-        for token in doc:
-            if token.lemma_ in weekdays:
-                found_day = token.lemma_
-                break
-
-        # Ищем время через сущности TIME или токены
-        hour, minute = 10, 0
-        time_match = None
-
-        for ent in doc.ents:
-            if ent.label_ == "TIME":
-                time_match = ent.text
-                break
-
-        if not time_match:
-            for token in doc:
-                if token.shape_ == "dd:dd" or token.shape_ == "dd.dd":
-                    time_match = token.text
-                    break
-
-        if time_match:
-            # Пробуем разные разделители
-            for sep in [":", ".", ";", "-"]:
-                if sep in time_match:
-                    parts = time_match.split(sep)
-                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                        hour, minute = int(parts[0]), int(parts[1])
-                        break
-
-        if found_day:
-            return {
-                "when": None,
-                "type": "recurring",
-                "recurring_type": "weekly",
-                "weekday": weekdays.get(found_day, found_day),
-                "hour": hour,
-                "minute": minute,
-                "text": text,
-            }
-        else:
-            # Ежедневное повторение
-            return {
-                "when": None,
-                "type": "recurring",
-                "recurring_type": "daily",
-                "hour": hour,
-                "minute": minute,
-                "text": text,
-            }
-
-    # 7. Только время (сегодня)
-    time_match = None
-    for ent in doc.ents:
-        if ent.label_ == "TIME":
-            time_match = ent.text
-            break
-
-    if not time_match:
-        for token in doc:
-            if token.shape_ == "dd:dd" or token.shape_ == "dd.dd":
-                time_match = token.text
-                break
-
-    if time_match:
-        for sep in [":", ".", ";", "-"]:
-            if sep in time_match:
-                parts = time_match.split(sep)
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    hour, minute = int(parts[0]), int(parts[1])
-                    now = datetime.now()
-                    when = now.replace(
-                        hour=hour, minute=minute, second=0, microsecond=0
-                    )
-                    if when < now:
-                        when += timedelta(days=1)
-                    return {"when": when, "type": "time_only", "text": text}
-
-    # 8. ДЕФОЛТ
-    now = datetime.now()
-    when = now.replace(hour=10, minute=0, second=0, microsecond=0)
-    if when < now:
-        when += timedelta(days=1)
-
-    return {
-        "when": when,
-        "type": "default",
-        "text": text,
-        "message": "Установлено на завтра 10:00 (по умолчанию)",
-    }
+    await state.clear()
 
 
-def format_result(result):
-    """Форматирует результат для вывода"""
-    if result["type"] == "recurring":
-        if result["recurring_type"] == "daily":
-            return f"🔄 Ежедневно в {result['hour']:02d}:{result['minute']:02d}"
-        else:
-            weekday_ru = {
-                "monday": "понедельник",
-                "tuesday": "вторник",
-                "wednesday": "среда",
-                "thursday": "четверг",
-                "friday": "пятница",
-                "saturday": "суббота",
-                "sunday": "воскресенье",
-            }
-            day = result.get("weekday", "")
-            if day in weekday_ru:
-                day = weekday_ru[day]
-            return f"🔄 Каждый {day} в {result['hour']:02d}:{result['minute']:02d}"
-    elif result.get("when"):
-        return f"⏰ {result['when'].strftime('%d.%m.%Y %H:%M')}"
-    else:
-        return result.get("message", "Не удалось распарсить")
+@dp.callback_query(F.data == "confirm_no", User.waiting_for_confirmation)
+async def process_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("Отменено")
+    await callback.message.edit_text("❌ Создание напоминания отменено.")
+    await state.clear()
 
 
-# === ТЕСТ ===
-if __name__ == "__main__":
-    test_texts = [
-        "Напомни купить молоко завтра в 15:30",
-        "Встреча 31 августа 2025 в 14:30",
-        "Позвонить через 5 минут",
-        "Каждый понедельник в 11:00",
-        "Сделать заказ до 25.12.2025",
-        "Напомни выключить свет",
-        "Встреча в 15:30",
-        "Каждый день в 08:00",
-        "Напомни через 2 часа",
-        "Послезавтра в 12:00",
+async def set_main_menu(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Запустить бота"),
+        BotCommand(command="start_notification", description="Запустить notification"),
     ]
-
-    print("=" * 60)
-    print("ТЕСТИРОВАНИЕ ИСПРАВЛЕННОГО ПАРСЕРА")
-    print("=" * 60)
-
-    for text in test_texts:
-        print(f"\n📝 {text}")
-        result = parse_with_spacy_fixed(text)
-        print(f"   Тип: {result['type']}")
-        print(f"   Результат: {format_result(result)}")
-        if result.get("message"):
-            print(f"   Сообщение: {result['message']}")
+    await bot.set_my_commands(commands)
 
 
-bot.infinity_polling()
+async def main():
+    try:
+        await init_db()
+        print("БД успешно подключена!")
+
+        # Установка команд меню
+        await set_main_menu(bot)
+        print("Бот запущен!")
+
+        # Запускаем фоновую задачу
+        asyncio.create_task(check_reminders(bot, db_pool))
+
+        # Запуск поллинга
+        await dp.start_polling(bot)
+    finally:
+        if db_pool:
+            await db_pool.close()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
