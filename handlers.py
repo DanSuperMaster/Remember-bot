@@ -9,24 +9,26 @@ from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 
 import db
 from config import MOSCOW_TZ
-from keyboards import DAY_TIMES, REPETITION_TIMES, TIME_TIMES
+from keyboards import (
+    DAY_TIMES,
+    REPETITION_TIMES,
+    TIME_TIMES,
+    build_main_menu_keyboard,
+)
 from states import User
 
 router = Router()
 
 
-@router.message(Command("start"))
-async def start_message(message: types.Message):
-    await message.answer("Это бот, который создан для того, чтобы напоминать о чём-то.")
-
-
-@router.message(Command("start_notification"))
-async def get_notification(message: types.Message, state: FSMContext):
+async def start_reminder_creation(
+    user_id: int, message: types.Message, state: FSMContext
+):
+    """Вспомогательная функция для запуска процесса создания напоминания."""
     await state.clear()
     builder = InlineKeyboardBuilder()
 
     await state.set_state(User.waiting_for_day)
-    await state.update_data(user_id=message.from_user.id)
+    await state.update_data(user_id=user_id)
 
     for i in range(len(DAY_TIMES)):
         builder.add(
@@ -37,6 +39,25 @@ async def get_notification(message: types.Message, state: FSMContext):
     await message.answer(
         "Выберите дату из списка ниже:", reply_markup=builder.as_markup()
     )
+
+
+@router.message(Command("start"))
+async def start_message(message: types.Message):
+    await message.answer(
+        "Это бот, который создан для того, чтобы напоминать о чём-то.\n\n"
+        "Нажмите кнопку ниже, чтобы создать новое напоминание!",
+        reply_markup=build_main_menu_keyboard(),
+    )
+
+
+@router.message(Command("start_notification"))
+async def get_notification_cmd(message: types.Message, state: FSMContext):
+    await start_reminder_creation(message.from_user.id, message, state)
+
+
+@router.message(F.text == "⏰ Создать напоминание")
+async def get_notification_btn(message: types.Message, state: FSMContext):
+    await start_reminder_creation(message.from_user.id, message, state)
 
 
 @router.callback_query(F.data.startswith("select_"), User.waiting_for_day)

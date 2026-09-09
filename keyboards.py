@@ -1,4 +1,9 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 DAY_TIMES = ["Сегодня", "Завтра", "Через неделю", "Кастомное"]
@@ -10,6 +15,17 @@ REPETITION_TIMES = [
     "Каждый месяц",
     "Кастомное",
 ]
+
+
+def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="⏰ Создать напоминание")],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=kb,
+        resize_keyboard=True,
+        persistent=True,
+    )
 
 
 def build_reminder_keyboard(
